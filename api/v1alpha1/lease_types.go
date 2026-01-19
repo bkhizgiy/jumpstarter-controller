@@ -29,8 +29,11 @@ type LeaseSpec struct {
 	// Can be omitted (nil) when both BeginTime and EndTime are provided,
 	// in which case it's calculated as EndTime - BeginTime.
 	Duration *metav1.Duration `json:"duration,omitempty"`
-	// The selector for the exporter to be used
-	Selector metav1.LabelSelector `json:"selector"`
+	// The selector for the exporter to be used (mutually exclusive with DeviceName)
+	Selector metav1.LabelSelector `json:"selector,omitempty"`
+	// Direct device selection by name (mutually exclusive with Selector)
+	// When specified, the lease will only match this specific exporter
+	DeviceName *string `json:"deviceName,omitempty"`
 	// The release flag requests the controller to end the lease now
 	Release bool `json:"release,omitempty"`
 	// Requested start time. If omitted, lease starts when exporter is acquired.
