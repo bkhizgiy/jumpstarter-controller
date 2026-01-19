@@ -25,6 +25,7 @@ import (
 
 	jumpstarterdevv1alpha1 "github.com/jumpstarter-dev/jumpstarter-controller/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -209,6 +210,12 @@ func (r *LeaseReconciler) reconcileStatusExporterRef(
 				return nil
 			}
 		}
+
+		// Check if direct device selection by name is specified
+		if lease.Spec.DeviceName != nil && *lease.Spec.DeviceName != "" {
+			return r.reconcileDirectExporterSelection(ctx, result, lease)
+		}
+
 		logger.Info("Looking for a matching exporter for lease", "lease", lease.Name, "client", lease.GetClientName(), "selector", lease.Spec.Selector)
 
 		selector, err := lease.GetExporterSelector()
@@ -225,88 +232,137 @@ func (r *LeaseReconciler) reconcileStatusExporterRef(
 			return fmt.Errorf("reconcileStatusExporterRef: failed to list matching exporters: %w", err)
 		}
 
-		approvedExporters, err := r.attachMatchingPolicies(ctx, lease, matchingExporters.Items)
-		if err != nil {
-			return fmt.Errorf("reconcileStatusExporterRef: failed to handle policy approval: %w", err)
-		}
+		return r.selectAndAssignExporter(ctx, result, lease, matchingExporters.Items)
+	}
 
-		if len(approvedExporters) == 0 {
-			lease.SetStatusUnsatisfiable(
-				"NoAccess",
+	return nil
+}
+
+// Unified function for selecting and assigning an exporter from a list of candidate exporters.
+// Used by both selector-based and name-based selection.
+func (r *LeaseReconciler) selectAndAssignExporter(
+	ctx context.Context,
+	result *ctrl.Result,
+	lease *jumpstarterdevv1alpha1.Lease,
+	candidateExporters []jumpstarterdevv1alpha1.Exporter,
+) error {
+	approvedExporters, err := r.attachMatchingPolicies(ctx, lease, candidateExporters)
+	if err != nil {
+		return fmt.Errorf("selectAndAssignExporter: failed to handle policy approval: %w", err)
+	}
+
+	if len(approvedExporters) == 0 {
+		if len(candidateExporters) == 1 {
+			// Name-based selection: single exporter
+			lease.SetStatusUnsatisfiable("NoAccess",
+				"Device '%s' exists but no policy allows your client to access it",
+				candidateExporters[0].Name)
+		} else {
+			// Selector-based selection: multiple exporters
+			lease.SetStatusUnsatisfiable("NoAccess",
 				"While there are %d exporters matching the selector, none of them are approved by any policy for your client",
-				len(matchingExporters.Items),
-			)
-			return nil
-		}
-
-		onlineApprovedExporters := filterOutOfflineExporters(approvedExporters)
-		if len(onlineApprovedExporters) == 0 {
-			lease.SetStatusPending(
-				"Offline",
-				"While there are %d available exporters (i.e. %s), none of them are online",
-				len(approvedExporters),
-				approvedExporters[0].Exporter.Name,
-			)
-			result.RequeueAfter = time.Second
-			return nil
-		}
-
-		// Filter out exporters that are already leased
-		activeLeases, err := r.ListActiveLeases(ctx, lease.Namespace)
-		if err != nil {
-			return fmt.Errorf("reconcileStatusExporterRef: failed to list active leases: %w", err)
-		}
-
-		onlineApprovedExporters = attachExistingLeases(onlineApprovedExporters, activeLeases.Items)
-		orderedExporters := orderApprovedExporters(onlineApprovedExporters)
-
-		if len(orderedExporters) > 0 && orderedExporters[0].Policy.SpotAccess {
-			lease.SetStatusUnsatisfiable("SpotAccess",
-				"The only possible exporters are under spot access (i.e. %s), but spot access is still not implemented",
-				orderedExporters[0].Exporter.Name)
-			return nil
-		}
-
-		availableExporters := filterOutLeasedExporters(onlineApprovedExporters)
-		if len(availableExporters) == 0 {
-			lease.SetStatusPending("NotAvailable",
-				"There are %d approved exporters, (i.e. %s) but all of them are already leased",
-				len(onlineApprovedExporters),
-				onlineApprovedExporters[0].Exporter.Name,
-			)
-			result.RequeueAfter = time.Second
-			return nil
-		}
-
-		// TODO: here there's room for improvement, i.e. we could have multiple
-		// clients trying to lease the same exporters, we should look at priorities
-		// and spot access to decide which client gets the exporter, this probably means
-		// that we will need to construct a lease scheduler with the view of all leases
-		// and exporters in the system, and (maybe) a priority queue for the leases.
-
-		// For now, we just select the best available exporter without considering other
-		// ongoing lease requests
-
-		selected := availableExporters[0]
-
-		if selected.ExistingLease != nil {
-			// TODO: Implement eviction of spot access leases
-			lease.SetStatusPending("NotAvailable",
-				"Exporter %s is already leased by another client under spot access, but spot access eviction still not implemented",
-				selected.Exporter.Name)
-			result.RequeueAfter = time.Second
-			return nil
-		}
-
-		lease.Status.Priority = selected.Policy.Priority
-		lease.Status.SpotAccess = selected.Policy.SpotAccess
-		lease.Status.ExporterRef = &corev1.LocalObjectReference{
-			Name: selected.Exporter.Name,
+				len(candidateExporters))
 		}
 		return nil
 	}
 
+	onlineApprovedExporters := filterOutOfflineExporters(approvedExporters)
+	if len(onlineApprovedExporters) == 0 {
+		lease.SetStatusPending(
+			"Offline",
+			"While there are %d available exporters (i.e. %s), none of them are online",
+			len(approvedExporters),
+			approvedExporters[0].Exporter.Name,
+		)
+		result.RequeueAfter = time.Second
+		return nil
+	}
+
+	activeLeases, err := r.ListActiveLeases(ctx, lease.Namespace)
+	if err != nil {
+		return fmt.Errorf("selectAndAssignExporter: failed to list active leases: %w", err)
+	}
+
+	onlineApprovedExporters = attachExistingLeases(onlineApprovedExporters, activeLeases.Items)
+	orderedExporters := orderApprovedExporters(onlineApprovedExporters)
+
+	if len(orderedExporters) > 0 && orderedExporters[0].Policy.SpotAccess {
+		lease.SetStatusUnsatisfiable("SpotAccess",
+			"The only possible exporters are under spot access (i.e. %s), but spot access is still not implemented",
+			orderedExporters[0].Exporter.Name)
+		return nil
+	}
+
+	availableExporters := filterOutLeasedExporters(onlineApprovedExporters)
+	if len(availableExporters) == 0 {
+		lease.SetStatusPending("NotAvailable",
+			"There are %d approved exporters, (i.e. %s) but all of them are already leased",
+			len(onlineApprovedExporters),
+			onlineApprovedExporters[0].Exporter.Name,
+		)
+		result.RequeueAfter = time.Second
+		return nil
+	}
+
+	// TODO: here there's room for improvement, i.e. we could have multiple
+	// clients trying to lease the same exporters, we should look at priorities
+	// and spot access to decide which client gets the exporter, this probably means
+	// that we will need to construct a lease scheduler with the view of all leases
+	// and exporters in the system, and (maybe) a priority queue for the leases.
+
+	// For now, we just select the best available exporter without considering other
+	// ongoing lease requests
+
+	selected := availableExporters[0]
+
+	if selected.ExistingLease != nil {
+		// TODO: Implement eviction of spot access leases
+		lease.SetStatusPending("NotAvailable",
+			"Exporter %s is already leased by another client under spot access, but spot access eviction still not implemented",
+			selected.Exporter.Name)
+		result.RequeueAfter = time.Second
+		return nil
+	}
+
+	lease.Status.Priority = selected.Policy.Priority
+	lease.Status.SpotAccess = selected.Policy.SpotAccess
+	lease.Status.ExporterRef = &corev1.LocalObjectReference{
+		Name: selected.Exporter.Name,
+	}
 	return nil
+}
+
+// Handles direct exporter selection by name
+func (r *LeaseReconciler) reconcileDirectExporterSelection(
+	ctx context.Context,
+	result *ctrl.Result,
+	lease *jumpstarterdevv1alpha1.Lease,
+) error {
+	logger := log.FromContext(ctx)
+	deviceName := *lease.Spec.DeviceName
+
+	logger.Info("Looking for specific device for lease",
+		"lease", lease.Name,
+		"client", lease.GetClientName(),
+		"deviceName", deviceName)
+
+	// Get the specific exporter by device name
+	var exporter jumpstarterdevv1alpha1.Exporter
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: lease.Namespace,
+		Name:      deviceName,
+	}, &exporter)
+
+	if err != nil {
+		if errors.IsNotFound(err) {
+			lease.SetStatusInvalid("ExporterNotFound",
+				"Device '%s' not found in namespace '%s'",
+				deviceName, lease.Namespace)
+			return nil
+		}
+		return fmt.Errorf("reconcileDirectExporterSelection: failed to get exporter: %w", err)
+	}
+	return r.selectAndAssignExporter(ctx, result, lease, []jumpstarterdevv1alpha1.Exporter{exporter})
 }
 
 // attachMatchingPolicies attaches the matching policies to the list of online exporters

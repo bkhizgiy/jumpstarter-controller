@@ -174,9 +174,32 @@ func LeaseFromProtobuf(
 	key types.NamespacedName,
 	clientRef corev1.LocalObjectReference,
 ) (*Lease, error) {
-	selector, err := ParseLabelSelector(req.Selector)
-	if err != nil {
-		return nil, err
+	var selector *metav1.LabelSelector // nil initially, only set if selector-based selection is used
+	var deviceName *string
+
+	switch selection := req.ExporterSelection.(type) {
+	case *cpb.Lease_Selector:
+		if selection.Selector == "" {
+			return nil, fmt.Errorf("selector cannot be empty")
+		}
+		var err error
+		selector, err = ParseLabelSelector(selection.Selector)
+		if err != nil {
+			return nil, err
+		}
+	case *cpb.Lease_ExporterName:
+		if selection.ExporterName == "" {
+			return nil, fmt.Errorf("exporter_name cannot be empty")
+		}
+		exporterKey, err := utils.ParseExporterIdentifier(selection.ExporterName)
+		if err != nil {
+			return nil, fmt.Errorf("invalid exporter_name: %w", err)
+		}
+		deviceName = &exporterKey.Name
+	case nil:
+		return nil, fmt.Errorf("either selector or exporter_name must be specified in exporter_selection")
+	default:
+		return nil, fmt.Errorf("unknown exporter_selection type: %T", selection)
 	}
 
 	var beginTime, endTime *metav1.Time
@@ -195,18 +218,29 @@ func LeaseFromProtobuf(
 		return nil, err
 	}
 
+	// Build the LeaseSpec - only set Selector if deviceName is nil (selector-based selection)
+	// For name-based selection, Selector remains at zero value (unused)
+	spec := LeaseSpec{
+		ClientRef:  clientRef,
+		Duration:   duration,
+		DeviceName: deviceName,
+		BeginTime:  beginTime,
+		EndTime:    endTime,
+	}
+
+	if deviceName == nil {
+		if selector == nil {
+			return nil, fmt.Errorf("selector must be provided when deviceName is not set")
+		}
+		spec.Selector = *selector
+	}
+
 	return &Lease{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: key.Namespace,
 			Name:      key.Name,
 		},
-		Spec: LeaseSpec{
-			ClientRef: clientRef,
-			Duration:  duration,
-			Selector:  *selector,
-			BeginTime: beginTime,
-			EndTime:   endTime,
-		},
+		Spec: spec,
 	}, nil
 }
 
@@ -228,9 +262,24 @@ func (l *Lease) ToProtobuf() *cpb.Lease {
 
 	lease := cpb.Lease{
 		Name:       fmt.Sprintf("namespaces/%s/leases/%s", l.Namespace, l.Name),
-		Selector:   metav1.FormatLabelSelector(&l.Spec.Selector),
 		Client:     ptr.To(fmt.Sprintf("namespaces/%s/clients/%s", l.Namespace, l.Spec.ClientRef.Name)),
 		Conditions: conditions,
+	}
+
+	// Set the oneof exporter_selection field based on which is specified
+	if l.Spec.DeviceName != nil && *l.Spec.DeviceName != "" {
+		// Direct device selection by resource name
+		lease.ExporterSelection = &cpb.Lease_ExporterName{
+			ExporterName: utils.UnparseExporterIdentifier(kclient.ObjectKey{
+				Namespace: l.Namespace,
+				Name:      *l.Spec.DeviceName,
+			}),
+		}
+	} else {
+		// Selector-based exporter matching
+		lease.ExporterSelection = &cpb.Lease_Selector{
+			Selector: metav1.FormatLabelSelector(&l.Spec.Selector),
+		}
 	}
 	if l.Spec.Duration != nil {
 		lease.Duration = durationpb.New(l.Spec.Duration.Duration)
